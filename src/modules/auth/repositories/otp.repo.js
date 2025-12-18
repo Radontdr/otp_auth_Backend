@@ -55,3 +55,39 @@ export async function invalidateOtp(id) {
     [id]
   );
 }
+
+export async function incrementAttempts(id) {
+  return db.query(
+    `UPDATE otp_requests
+     SET attempts = attempts + 1
+     WHERE id = $1
+     RETURNING *`,
+    [id]
+  );
+}
+
+export async function markBlocked(id) {
+  await db.query(
+    `UPDATE otp_requests SET status='BLOCKED' WHERE id=$1`,
+    [id]
+  );
+}
+
+export async function markVerified(id) {
+  await db.query(
+    `UPDATE otp_requests SET status='VERIFIED' WHERE id=$1`,
+    [id]
+  );
+}
+
+export async function incrementResend(id, cooldownUntil) {
+  return db.query(
+    `UPDATE otp_requests
+     SET resend_count = resend_count + 1,
+         cooldown_until = $2
+     WHERE id = $1
+     RETURNING *`,
+    [id, cooldownUntil]
+  );
+}
+
