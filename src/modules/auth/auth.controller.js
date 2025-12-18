@@ -1,4 +1,9 @@
-import { sendOtpService } from "./auth.service.js";
+import {
+  sendOtpService,
+  verifyOtpService,
+  resendOtpService
+} from "./auth.service.js";
+
 import { auditLog } from "./repositories/audit.repo.js";
 
 export async function sendOtpController(req, res) {
@@ -29,6 +34,14 @@ export async function verifyOtpController(req, res) {
     const result = await verifyOtpService(traceId, identifier, otp);
     res.status(200).json(result);
   } catch (err) {
+    await auditLog({
+      traceId,
+      apiName: "VERIFY_OTP",
+      step: "ERROR",
+      status: "FAIL",
+      message: err.message
+    });
+
     res.status(400).json({ error: err.message, traceId });
   }
 }
@@ -41,7 +54,14 @@ export async function resendOtpController(req, res) {
     const result = await resendOtpService(traceId, identifier);
     res.status(200).json(result);
   } catch (err) {
+    await auditLog({
+      traceId,
+      apiName: "RESEND_OTP",
+      step: "ERROR",
+      status: "FAIL",
+      message: err.message
+    });
+
     res.status(400).json({ error: err.message, traceId });
   }
 }
-

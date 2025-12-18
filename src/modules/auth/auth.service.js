@@ -1,14 +1,72 @@
+import crypto from "crypto";
+
 import { OTP_POLICY } from "./policies/otp.policy.js";
 import { generateOtp, makeSalt, hashOtp } from "../../utils/crypto.js";
-import { isValidEmail, isValidMobile, normalizeIdentifier } from "../../utils/validate.js";
+import { normalizeIdentifier, isValidEmail, isValidMobile } from "../../utils/validate.js";
+import { generateAccessToken } from "../../utils/jwt.js";
+
 import { auditLog } from "./repositories/audit.repo.js";
 import { findUserByIdentifier, createUser } from "./repositories/user.repo.js";
-import { getLatestOtp, createOtp, invalidateOtp } from "./repositories/otp.repo.js";
+import {
+  getLatestOtp,
+  createOtp,
+  invalidateOtp,
+  incrementAttempts,
+  markBlocked,
+  markVerified,
+  incrementResend
+} from "./repositories/otp.repo.js";
+
+/* sendOtpService remains as you already implemented */
+
+export async function verifyOtpService(traceId, rawIdentifier, otp) {
+  const apiName = "VERIFY_OTP";
+  const identifier = normalizeIdentifier(rawIdentifier);
+
+  const record = await getLatestOtp(identifier);
+  if (!record) throw new Error("OTP_NOT_FOUND");
+
+  if (record.status !== "PENDING") throw new Error("OTP_NOT_ACTIVE");
+  if (new Date(record.expires_at) < new Date()) throw new Error("OTP_EXPIRED");
+
+  const computedHash = hashOtp(otp, record.salt, identifier);
+  const match = crypto.timingSafeEqual(
+    Buffer.from(computedHash, "hex"),
+    Buffer.from(record.otp_hash, "hex")
+  );
+
+  if (!match) {
+    const updated = await incrementAttempts(record.id);
+    if (updated.rows[0].attempts >= record.max_attempts) {
+      await markBlocked(record.id);
+      throw new Error("OTP_BLOCKED");
+    }
+    throw new Error("INVALID_OTP");
+  }
+
+  await markVerified(record.id);
+
+  const accessToken = generateAccessToken({
+    userId: record.user_id,
+    identifier: record.identifier
+  });
+
+  await auditLog({
+    traceId,
+    apiName,
+    step: "OTP_VERIFIED",
+    status: "SUCCESS",
+    message: "OTP verified successfully"
+  });
+
+  return {
+    message: "Login successful",
+    accessToken
+  };
+}
 
 export async function sendOtpService(traceId, rawIdentifier) {
   const apiName = "SEND_OTP";
-  await auditLog({ traceId, apiName, step: "START", status: "INFO", message: "Send OTP started" });
-
   const identifier = normalizeIdentifier(rawIdentifier);
   const type = identifier.includes("@") ? "EMAIL" : "MOBILE";
 
@@ -17,15 +75,7 @@ export async function sendOtpService(traceId, rawIdentifier) {
       ? isValidEmail(identifier)
       : isValidMobile(identifier);
 
-  if (!valid) {
-    await auditLog({ traceId, apiName, step: "VALIDATION", status: "FAIL", message: "Invalid identifier" });
-    throw new Error("INVALID_IDENTIFIER");
-  }
-
-  const previousOtp = await getLatestOtp(identifier);
-  if (previousOtp && previousOtp.status === "PENDING") {
-    await invalidateOtp(previousOtp.id);
-  }
+  if (!valid) throw new Error("INVALID_IDENTIFIER");
 
   let user = await findUserByIdentifier(identifier, type);
 
@@ -47,7 +97,7 @@ export async function sendOtpService(traceId, rawIdentifier) {
   });
 
   if (!user) {
-    user = await createUser(identifier, type);
+    await createUser(identifier, type);
   }
 
   await auditLog({
@@ -55,61 +105,21 @@ export async function sendOtpService(traceId, rawIdentifier) {
     apiName,
     step: "OTP_CREATED",
     status: "SUCCESS",
-    message: "OTP generated and stored",
+    message: "OTP generated",
     meta: { otpId: otpRecord.id }
   });
 
-  console.log("OTP (for testing):", otp); // REMOVE in production
+  console.log("OTP (dev only):", otp);
 
   return { message: "OTP sent successfully", traceId };
 }
 
-import crypto from "crypto";
-
-export async function verifyOtpService(traceId, rawIdentifier, otp) {
-  const apiName = "VERIFY_OTP";
-  const identifier = normalizeIdentifier(rawIdentifier);
-
-  const record = await getLatestOtp(identifier);
-  if (!record) throw new Error("OTP_NOT_FOUND");
-
-  if (record.status !== "PENDING") throw new Error("OTP_NOT_ACTIVE");
-  if (new Date(record.expires_at) < new Date()) throw new Error("OTP_EXPIRED");
-
-  const computedHash = hashOtp(otp, record.salt, identifier);
-  const match = crypto.timingSafeEqual(
-    Buffer.from(computedHash, "hex"),
-    Buffer.from(record.otp_hash, "hex")
-  );
-
-  if (!match) {
-    const updated = await incrementAttempts(record.id);
-
-    if (updated.rows[0].attempts >= record.max_attempts) {
-      await markBlocked(record.id);
-      throw new Error("OTP_BLOCKED");
-    }
-
-    throw new Error("INVALID_OTP");
-  }
-
-  await markVerified(record.id);
-
-  await auditLog({
-    traceId,
-    apiName,
-    step: "OTP_VERIFIED",
-    status: "SUCCESS",
-    message: "OTP verified successfully"
-  });
-
-  return { message: "Login successful", traceId };
-}
 
 export async function resendOtpService(traceId, rawIdentifier) {
+  const apiName = "RESEND_OTP";
   const identifier = normalizeIdentifier(rawIdentifier);
-  const record = await getLatestOtp(identifier);
 
+  const record = await getLatestOtp(identifier);
   if (!record) throw new Error("OTP_NOT_FOUND");
 
   if (record.resend_count >= record.max_resends) {
@@ -120,7 +130,20 @@ export async function resendOtpService(traceId, rawIdentifier) {
     throw new Error("COOLDOWN_ACTIVE");
   }
 
+  const cooldownUntil = new Date(
+    Date.now() + OTP_POLICY.RESEND_COOLDOWN_SECONDS * 1000
+  );
+
+  await incrementResend(record.id, cooldownUntil);
   await invalidateOtp(record.id);
+
+  await auditLog({
+    traceId,
+    apiName,
+    step: "RESEND",
+    status: "SUCCESS",
+    message: "OTP resent"
+  });
 
   return sendOtpService(traceId, identifier);
 }
